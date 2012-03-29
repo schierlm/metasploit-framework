@@ -61,6 +61,10 @@ module Msf::Payload::Java
 		jar
 	end
 
+	def war_servlet_name
+		"PayloadServlet"
+	end
+	
 	#
 	# Like #generate_jar, this method is used by stagers to create a war file
 	# as a Rex::Zip::Jar object.
@@ -80,7 +84,7 @@ module Msf::Payload::Java
 <web-app>
 <servlet>
 <servlet-name>NAME</servlet-name>
-<servlet-class>metasploit.PayloadServlet</servlet-class>
+<servlet-class>metasploit.WAR_SERVLET_NAME</servlet-class>
 </servlet>
 <servlet-mapping>
 <servlet-name>NAME</servlet-name>
@@ -90,11 +94,12 @@ module Msf::Payload::Java
 }
 		app_name = opts[:app_name] || Rex::Text.rand_text_alpha_lower(rand(8)+8)
 
+		web_xml.gsub!(/WAR_SERVLET_NAME/, war_servlet_name)
 		web_xml.gsub!(/NAME/, app_name)
 
 		paths = [
 			[ "metasploit", "Payload.class" ],
-			[ "metasploit", "PayloadServlet.class" ],
+			[ "metasploit", "#{war_servlet_name}.class" ],
 		] + @class_files
 
 		zip.add_file('WEB-INF/', '')

