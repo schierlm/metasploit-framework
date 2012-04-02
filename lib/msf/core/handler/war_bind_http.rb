@@ -121,9 +121,9 @@ module WarBindHttp
 	end
 	
 	#
-	# Start monitoring for a connection.
+	# Run the handler after the exploit has succeeded.
 	#
-	def start_handler
+	def handler(sock)
 		classname = "metasploit.PayloadTunnelServlet\x00"
 		blob = ""
 		blob << self.generate_stage
