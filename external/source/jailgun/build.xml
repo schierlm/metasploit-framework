@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<project name="Jailgun" default="jar">
+
+	<target name="clean">
+		<delete dir="build" />
+	</target>
+
+	<target name="compile">
+		<mkdir dir="build/bin" />
+		<javac srcdir="src" destdir="build/bin" source="1.1" target="1.1" debug="no" classpath="../../../data/meterpreter/meterpreter.jar" />
+	</target>
+
+	<target name="jar" depends="compile">
+		<jar destfile="build/ext_server_jailgun.jar" basedir="build/bin">
+			<manifest>
+				<attribute name="Extension-Loader" value="com.metasploit.meterpreter.jailgun.Loader" />
+			</manifest>
+		</jar>
+	</target>
+
+	<target name="fix-timestamps" depends="jar">
+		<mkdir dir="build/tmp" />
+		<unzip src="build/ext_server_jailgun.jar" dest="build/tmp" />
+		<touch datetime="01/01/2000 00:00 AM">
+			<fileset dir="build/tmp" includes="**/*" />
+		</touch>
+		<delete file="build/ext_server_jailgun.jar" />
+		<zip destfile="build/ext_server_jailgun.jar">
+			<fileset dir="build/tmp" includes="META-INF/**" />
+			<fileset dir="build/tmp" excludes="META-INF/**" />
+		</zip>
+		<delete dir="build/tmp" />
+	</target>
+
+	<target name="deploy" depends="fix-timestamps">
+		<copy todir="../../../data/meterpreter">
+			<fileset dir="build" includes="ext_server_jailgun.jar" />
+		</copy>
+	</target>
+</project>
